@@ -1,164 +1,202 @@
-"use client"
+"use client";
 
-import { useEffect, useState } from "react"
-import Link from "next/link"
-import { Button } from "@/components/ui/button"
-import { Card } from "@/components/ui/card"
-import { ArrowLeft, BarChart3, CheckCircle2, Clock, Target } from "lucide-react"
-import Navbar from "@/components/navbar"
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from "recharts"
+import React, { useEffect, useMemo, useState } from "react";
+import { useSearchParams, useRouter } from "next/navigation";
+import { createClient } from "@supabase/supabase-js";
+import Link from "next/link";
+import { Button } from "@/components/ui/button";
+import Navbar from "@/components/navbar";
+import { Card } from "@/components/ui/card";
 
-interface Milestone {
-  id: number
-  topic: string
-  status: "pending" | "completed" | "skipped"
+type StatusDb = "pending" | "in_progress" | "done" | "skipped" | "hard";
+
+function getClientId() {
+  const key = "findearn_client_id";
+  let id = typeof window !== "undefined" ? localStorage.getItem(key) : null;
+  if (!id && typeof window !== "undefined") {
+    id = crypto.randomUUID();
+    localStorage.setItem(key, id);
+  }
+  return id ?? "server";
 }
 
 export default function DashboardPage() {
-  const [roadmapData, setRoadmapData] = useState<any>(null)
-  const [milestones, setMilestones] = useState<Milestone[]>([])
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  const [loading, setLoading] = useState(true);
+
+  const rid = searchParams.get("rid") || ""; // roadmap id
+  const cidParam = searchParams.get("cid") || "";
+  const cid = cidParam || getClientId();
+
+  const supabase = useMemo(
+    () =>
+      createClient(
+        process.env.NEXT_PUBLIC_SUPABASE_URL as string,
+        process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY as string,
+        { global: { headers: { "x-client-id": cid } } }
+      ),
+    [cid]
+  );
+
+  const [counts, setCounts] = useState({
+    total: 0,
+    done: 0,
+    pending: 0,
+    skipped: 0,
+    hard: 0,
+    in_progress: 0,
+  });
+
+  const [progressByWeek, setProgressByWeek] = useState<{ label: string; value: number }[]>([]);
 
   useEffect(() => {
-    const saved = localStorage.getItem("currentRoadmap")
-    if (saved) {
-      const data = JSON.parse(saved)
-      setRoadmapData(data)
-      setMilestones(data.milestones || [])
+    async function load() {
+      try {
+        setLoading(true);
+
+        // If no rid provided, pick latest roadmap for this client
+        let roadmapId = rid;
+        if (!roadmapId) {
+          const { data: latest } = await supabase
+            .from("roadmaps")
+            .select("id, created_at")
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          roadmapId = latest?.id || "";
+          if (roadmapId) {
+            router.replace(`/dashboard?rid=${roadmapId}&cid=${cid}`);
+          }
+        }
+        if (!roadmapId) {
+          setCounts({ total: 0, done: 0, pending: 0, skipped: 0, hard: 0, in_progress: 0 });
+          setProgressByWeek([]);
+          setLoading(false);
+          return;
+        }
+
+        // 1) Milestones counts
+        const { data: milestones } = await supabase
+          .from("milestones")
+          .select("id,status")
+          .eq("roadmap_id", roadmapId);
+
+        const total = milestones?.length || 0;
+        const done = milestones?.filter((m) => m.status === "done").length || 0;
+        const skipped = milestones?.filter((m) => m.status === "skipped").length || 0;
+        const hard = milestones?.filter((m) => m.status === "hard").length || 0;
+        const in_progress = milestones?.filter((m) => m.status === "in_progress").length || 0;
+        const pending = total - (done + skipped + hard + in_progress);
+
+        setCounts({ total, done, pending, skipped, hard, in_progress });
+
+        // 2) Progress over time => count "done" feedback per week
+        const { data: fb } = await supabase
+          .from("feedback")
+          .select("action, created_at")
+          .eq("action", "done");
+
+        // group by ISO week (YYYY-WW)
+        const byWeek = new Map<string, number>();
+        (fb || []).forEach((f) => {
+          const d = new Date(f.created_at);
+          // week label: e.g., "2025-W07"
+          const y = d.getFullYear();
+          const onejan = new Date(d.getFullYear(), 0, 1);
+          const week = Math.ceil((((d as any) - (onejan as any)) / 86400000 + onejan.getDay() + 1) / 7);
+          const label = `${y}-W${String(week).padStart(2, "0")}`;
+          byWeek.set(label, (byWeek.get(label) || 0) + 1);
+        });
+
+        // Keep last 8 weeks sorted
+        const series = [...byWeek.entries()]
+          .sort(([a], [b]) => (a < b ? -1 : 1))
+          .slice(-8)
+          .map(([label, value]) => ({ label, value }));
+
+        setProgressByWeek(series);
+      } finally {
+        setLoading(false);
+      }
     }
-  }, [])
+    load();
+  }, [rid, cid, supabase, router]);
 
-  const stats = {
-    total: milestones.length,
-    completed: milestones.filter((m) => m.status === "completed").length,
-    pending: milestones.filter((m) => m.status === "pending").length,
-    skipped: milestones.filter((m) => m.status === "skipped").length,
-  }
-
-  const completionPercentage = stats.total > 0 ? Math.round((stats.completed / stats.total) * 100) : 0
-
-  const chartData = [
-    { name: "Completed", value: stats.completed, fill: "#22c55e" },
-    { name: "Pending", value: stats.pending, fill: "#eab308" },
-    { name: "Skipped", value: stats.skipped, fill: "#ef4444" },
-  ]
-
-  const timelineData = [
-    { week: "Week 1", progress: 25 },
-    { week: "Week 2", progress: 50 },
-    { week: "Week 3", progress: 75 },
-    { week: "Week 4", progress: completionPercentage },
-  ]
+  const completionPct =
+    counts.total > 0 ? Math.round((counts.done / counts.total) * 100) : 0;
 
   return (
     <div className="min-h-screen bg-background">
       <Navbar />
-
-      <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
-        <div className="flex items-center justify-between mb-8">
+      <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
+        <div className="flex items-center justify-between mb-6">
           <h1 className="text-3xl font-bold text-foreground">Learning Dashboard</h1>
-          <Link href="/roadmap">
-            <Button variant="outline" size="sm">
-              <ArrowLeft className="w-4 h-4 mr-2" />
-              Back to Roadmap
-            </Button>
+          <Link href={`/roadmap?rid=${rid || ""}&cid=${cid}`}>
+            <Button variant="outline">← Back to Roadmap</Button>
           </Link>
         </div>
 
-        {/* Quick Stats */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-          <Card className="p-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm text-muted-foreground mb-1">Total Topics</p>
-                <p className="text-3xl font-bold text-foreground">{stats.total}</p>
-              </div>
-              <Target className="w-8 h-8 text-primary opacity-50" />
-            </div>
+        {/* Top Stats */}
+        <div className="grid grid-cols-1 sm:grid-cols-4 gap-4 mb-6">
+          <Card className="p-5">
+            <div className="text-sm text-muted-foreground">Total Topics</div>
+            <div className="text-3xl font-semibold mt-2">{counts.total}</div>
           </Card>
-
-          <Card className="p-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm text-muted-foreground mb-1">Completed</p>
-                <p className="text-3xl font-bold text-green-500">{stats.completed}</p>
-              </div>
-              <CheckCircle2 className="w-8 h-8 text-green-500 opacity-50" />
-            </div>
+          <Card className="p-5">
+            <div className="text-sm text-muted-foreground">Completed</div>
+            <div className="text-3xl font-semibold mt-2 text-green-600">{counts.done}</div>
           </Card>
-
-          <Card className="p-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm text-muted-foreground mb-1">Pending</p>
-                <p className="text-3xl font-bold text-yellow-500">{stats.pending}</p>
-              </div>
-              <Clock className="w-8 h-8 text-yellow-500 opacity-50" />
-            </div>
+          <Card className="p-5">
+            <div className="text-sm text-muted-foreground">Pending</div>
+            <div className="text-3xl font-semibold mt-2 text-yellow-600">{counts.pending}</div>
           </Card>
-
-          <Card className="p-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm text-muted-foreground mb-1">Completion</p>
-                <p className="text-3xl font-bold text-primary">{completionPercentage}%</p>
-              </div>
-              <BarChart3 className="w-8 h-8 text-primary opacity-50" />
-            </div>
+          <Card className="p-5">
+            <div className="text-sm text-muted-foreground">Completion</div>
+            <div className="text-3xl font-semibold mt-2">{completionPct}%</div>
           </Card>
         </div>
 
-        {/* Charts */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 mb-8">
+        {/* Lower Panels */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <Card className="p-6">
-            <h2 className="text-lg font-semibold text-foreground mb-4">Topic Status</h2>
-            <ResponsiveContainer width="100%" height={300}>
-              <PieChart>
-                <Pie
-                  data={chartData}
-                  cx="50%"
-                  cy="50%"
-                  labelLine={false}
-                  label={({ name, value }) => `${name}: ${value}`}
-                  outerRadius={80}
-                  fill="#8884d8"
-                  dataKey="value"
-                >
-                  {chartData.map((entry, index) => (
-                    <Cell key={`cell-${index}`} fill={entry.fill} />
-                  ))}
-                </Pie>
-                <Tooltip />
-              </PieChart>
-            </ResponsiveContainer>
+            <div className="text-lg font-medium mb-4">Topic Status</div>
+            {loading ? (
+              <div className="text-sm text-muted-foreground">Loading…</div>
+            ) : counts.total === 0 ? (
+              <div className="text-sm text-muted-foreground">No topics yet.</div>
+            ) : (
+              <ul className="text-sm space-y-1">
+                <li>Done: {counts.done}</li>
+                <li>In Progress: {counts.in_progress}</li>
+                <li>Hard: {counts.hard}</li>
+                <li>Skipped: {counts.skipped}</li>
+                <li>Pending: {counts.pending}</li>
+              </ul>
+            )}
           </Card>
 
           <Card className="p-6">
-            <h2 className="text-lg font-semibold text-foreground mb-4">Progress Over Time</h2>
-            <ResponsiveContainer width="100%" height={300}>
-              <BarChart data={timelineData}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="week" />
-                <YAxis />
-                <Tooltip />
-                <Bar dataKey="progress" fill="#2563eb" />
-              </BarChart>
-            </ResponsiveContainer>
+            <div className="text-lg font-medium mb-4">Progress Over Time</div>
+            {progressByWeek.length === 0 ? (
+              <div className="text-sm text-muted-foreground">No completed entries yet.</div>
+            ) : (
+              <div className="flex items-end gap-3 h-48">
+                {progressByWeek.map((d) => (
+                  <div key={d.label} className="flex flex-col items-center">
+                    <div
+                      className="bg-primary rounded w-8"
+                      style={{ height: `${Math.min(100, d.value * 14)}px` }}
+                      title={`${d.value} done`}
+                    />
+                    <div className="text-[11px] mt-1 text-muted-foreground">{d.label.replace(/^.*W/, "W")}</div>
+                  </div>
+                ))}
+              </div>
+            )}
           </Card>
         </div>
-
-        {/* Recommended Next Step */}
-        <Card className="p-6 bg-primary/5 border-primary/20">
-          <h2 className="text-lg font-semibold text-foreground mb-2">Recommended Next Step</h2>
-          <p className="text-muted-foreground mb-4">
-            {stats.pending > 0
-              ? "Continue with your pending topics to maintain momentum."
-              : "Great work! All topics are covered. Review completed topics to reinforce your learning."}
-          </p>
-          <Link href="/roadmap">
-            <Button className="bg-primary hover:bg-primary/90">Continue Learning</Button>
-          </Link>
-        </Card>
       </div>
     </div>
-  )
+  );
 }

@@ -1,7 +1,6 @@
 "use client"
-import React from "react"
 
-import { useState, useEffect, useMemo } from "react"
+import React, { useState, useEffect, useMemo } from "react"
 import { useRouter, useSearchParams } from "next/navigation"
 import Link from "next/link"
 import { createClient } from "@supabase/supabase-js"
@@ -17,12 +16,12 @@ import {
   Github,
   BookOpen,
   MessageCircleQuestion,
-  Globe
+  Globe,
 } from "lucide-react"
 import Navbar from "@/components/navbar"
 import Toast from "@/components/toast"
 
-type UiStatus = "pending" | "completed" | "skipped"
+type UiStatus = "pending" | "completed" | "skipped" | "hard"
 
 interface ResourceItem {
   type: string
@@ -53,16 +52,20 @@ function getClientId() {
 function mapDbStatusToUi(status?: string): UiStatus {
   if (status === "done") return "completed"
   if (status === "skipped") return "skipped"
+  if (status === "hard") return "hard"
   return "pending"
 }
 
-function mapUiStatusToDb(status: UiStatus): "pending" | "done" | "skipped" {
+function mapUiStatusToDb(
+  status: UiStatus
+): "pending" | "done" | "skipped" | "hard" {
   if (status === "completed") return "done"
   if (status === "skipped") return "skipped"
+  if (status === "hard") return "hard"
   return "pending"
 }
 
-// ---- NEW: helpers to group & render resources by source
+/** -------- grouped resources helpers -------- */
 const SOURCE_ORDER = ["youtube", "github", "books", "stackexchange", "wikipedia"] as const
 const SOURCE_LABEL: Record<string, string> = {
   youtube: "YouTube Videos",
@@ -125,7 +128,6 @@ export default function RoadmapPage() {
           .select("*")
           .eq("roadmap_id", roadmapId)
           .order("order_index")
-
         if (mErr) throw mErr
 
         const ids = (milestones || []).map((m: any) => m.id)
@@ -169,6 +171,7 @@ export default function RoadmapPage() {
   }, [roadmapId, clientIdFromUrl])
 
   const handleStatusChange = async (id: string, newStatus: UiStatus) => {
+    // optimistic UI
     const updated = roadmap.map((m) => (m.id === id ? { ...m, status: newStatus } : m))
     setRoadmap(updated)
 
@@ -181,18 +184,20 @@ export default function RoadmapPage() {
       await supabase.from("feedback").insert({
         milestone_id: id,
         client_id: cid,
-        action: dbStatus === "done" ? "done" : dbStatus,
+        action: dbStatus, // 'done' | 'skipped' | 'hard' | 'pending'
       })
 
       const messages: Record<UiStatus, string> = {
-        completed: "Progress updated! Keep up the great work!",
-        pending: "We'll help you with this topic",
-        skipped: "Topic skipped. We'll adjust your roadmap.",
+        completed: "Marked as done! Great work!",
+        hard: "Marked as hard. We'll adapt recommendations.",
+        skipped: "Marked as skipped. We'll adjust your plan.",
+        pending: "Set back to pending.",
       }
       setToast({ message: messages[newStatus], type: "success" })
     } catch (e) {
       console.error(e)
       setToast({ message: "Failed to update progress", type: "error" })
+      // on error you could refetch; for now, leave optimistic state
     }
   }
 
@@ -213,7 +218,7 @@ export default function RoadmapPage() {
         <div className="mb-8">
           <div className="flex items-center justify-between mb-3">
             <h1 className="text-3xl font-bold text-foreground">Your Learning Roadmap</h1>
-            <Link href="/dashboard">
+            <Link href={`/dashboard?rid=${roadmapId}&cid=${clientIdFromUrl || getClientId()}`}>
               <Button variant="outline" size="sm">
                 <BarChart3 className="w-4 h-4 mr-2" />
                 View Dashboard
@@ -304,6 +309,7 @@ export default function RoadmapPage() {
 
                     {/* Action Buttons */}
                     <div className="flex flex-col gap-2 w-full sm:w-auto">
+                      {/* DONE → green */}
                       <Button
                         size="sm"
                         variant={milestone.status === "completed" ? "default" : "outline"}
@@ -313,15 +319,25 @@ export default function RoadmapPage() {
                         <CheckCircle2 className="w-4 h-4 mr-2" />
                         Done
                       </Button>
+
+                      {/* TOO HARD → red */}
                       <Button
                         size="sm"
-                        variant={milestone.status === "pending" ? "outline" : "ghost"}
-                        onClick={() => handleStatusChange(milestone.id, "pending")}
+                        variant={milestone.status === "hard" ? "default" : "outline"}
+                        onClick={() => handleStatusChange(milestone.id, "hard")}
+                        className={milestone.status === "hard" ? "bg-red-500 hover:bg-red-600" : ""}
                       >
                         <AlertCircle className="w-4 h-4 mr-2" />
                         Too Hard
                       </Button>
-                      <Button size="sm" variant="outline" onClick={() => handleStatusChange(milestone.id, "skipped")}>
+
+                      {/* SKIP → yellow */}
+                      <Button
+                        size="sm"
+                        variant={milestone.status === "skipped" ? "default" : "outline"}
+                        onClick={() => handleStatusChange(milestone.id, "skipped")}
+                        className={milestone.status === "skipped" ? "bg-yellow-500 hover:bg-yellow-600 text-black" : ""}
+                      >
                         <SkipForward className="w-4 h-4 mr-2" />
                         Skip
                       </Button>
