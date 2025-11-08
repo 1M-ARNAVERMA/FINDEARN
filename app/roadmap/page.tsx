@@ -1,4 +1,5 @@
 "use client"
+import React from "react"
 
 import { useState, useEffect, useMemo } from "react"
 import { useRouter, useSearchParams } from "next/navigation"
@@ -6,18 +7,36 @@ import Link from "next/link"
 import { createClient } from "@supabase/supabase-js"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
-import { CheckCircle2, AlertCircle, SkipForward, ExternalLink, BarChart3 } from "lucide-react"
+import {
+  CheckCircle2,
+  AlertCircle,
+  SkipForward,
+  ExternalLink,
+  BarChart3,
+  Youtube,
+  Github,
+  BookOpen,
+  MessageCircleQuestion,
+  Globe
+} from "lucide-react"
 import Navbar from "@/components/navbar"
 import Toast from "@/components/toast"
 
 type UiStatus = "pending" | "completed" | "skipped"
+
+interface ResourceItem {
+  type: string
+  title?: string
+  summary?: string
+  url?: string
+}
 
 interface Milestone {
   id: string
   topic: string
   description: string
   duration: string
-  resources: Array<{ type: string; title?: string; summary?: string; url?: string }>
+  resources: ResourceItem[]
   status: UiStatus
 }
 
@@ -32,7 +51,6 @@ function getClientId() {
 }
 
 function mapDbStatusToUi(status?: string): UiStatus {
-  // DB uses: 'pending','in_progress','done','skipped','hard'
   if (status === "done") return "completed"
   if (status === "skipped") return "skipped"
   return "pending"
@@ -44,6 +62,33 @@ function mapUiStatusToDb(status: UiStatus): "pending" | "done" | "skipped" {
   return "pending"
 }
 
+// ---- NEW: helpers to group & render resources by source
+const SOURCE_ORDER = ["youtube", "github", "books", "stackexchange", "wikipedia"] as const
+const SOURCE_LABEL: Record<string, string> = {
+  youtube: "YouTube Videos",
+  github: "GitHub Repos",
+  books: "Google Books",
+  stackexchange: "Stack Exchange",
+  wikipedia: "Wikipedia",
+}
+const SOURCE_ICON: Record<string, React.ReactNode> = {
+  youtube: <Youtube className="w-4 h-4" />,
+  github: <Github className="w-4 h-4" />,
+  books: <BookOpen className="w-4 h-4" />,
+  stackexchange: <MessageCircleQuestion className="w-4 h-4" />,
+  wikipedia: <Globe className="w-4 h-4" />,
+}
+
+function groupResources(items: ResourceItem[]) {
+  const groups: Record<string, ResourceItem[]> = {}
+  for (const it of items) {
+    const key = (it.type || "").toLowerCase()
+    if (!groups[key]) groups[key] = []
+    groups[key].push(it)
+  }
+  return groups
+}
+
 export default function RoadmapPage() {
   const router = useRouter()
   const searchParams = useSearchParams()
@@ -52,11 +97,9 @@ export default function RoadmapPage() {
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null)
   const [loading, setLoading] = useState<boolean>(true)
 
-  // read params
   const roadmapId = searchParams.get("rid") || ""
   const clientIdFromUrl = searchParams.get("cid") || ""
 
-  // supabase client with x-client-id header
   const supabase = useMemo(() => {
     const cid = clientIdFromUrl || getClientId()
     return createClient(
@@ -67,7 +110,6 @@ export default function RoadmapPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [clientIdFromUrl])
 
-  // initial load from Supabase (roadmap + milestones + resources)
   useEffect(() => {
     async function load() {
       try {
@@ -78,7 +120,6 @@ export default function RoadmapPage() {
           return
         }
 
-        // fetch milestones
         const { data: milestones, error: mErr } = await supabase
           .from("milestones")
           .select("*")
@@ -87,7 +128,6 @@ export default function RoadmapPage() {
 
         if (mErr) throw mErr
 
-        // fetch resources for these milestones
         const ids = (milestones || []).map((m: any) => m.id)
         let resources: any[] = []
         if (ids.length) {
@@ -109,7 +149,7 @@ export default function RoadmapPage() {
             resources: (resources || [])
               .filter((r) => r.milestone_id === m.id)
               .map((r) => ({
-                type: r.source,
+                type: (r.source || "").toLowerCase(),
                 title: r.title,
                 url: r.url,
                 summary: r.meta?.extract,
@@ -129,25 +169,21 @@ export default function RoadmapPage() {
   }, [roadmapId, clientIdFromUrl])
 
   const handleStatusChange = async (id: string, newStatus: UiStatus) => {
-    // optimistic UI
     const updated = roadmap.map((m) => (m.id === id ? { ...m, status: newStatus } : m))
     setRoadmap(updated)
 
     try {
-      // update milestone status in DB
       const dbStatus = mapUiStatusToDb(newStatus)
       const { error: uErr } = await supabase.from("milestones").update({ status: dbStatus }).eq("id", id)
       if (uErr) throw uErr
 
-      // log feedback
       const cid = clientIdFromUrl || getClientId()
       await supabase.from("feedback").insert({
         milestone_id: id,
         client_id: cid,
-        action: dbStatus === "done" ? "done" : dbStatus, // 'pending' | 'done' | 'skipped'
+        action: dbStatus === "done" ? "done" : dbStatus,
       })
 
-      // toast
       const messages: Record<UiStatus, string> = {
         completed: "Progress updated! Keep up the great work!",
         pending: "We'll help you with this topic",
@@ -157,8 +193,6 @@ export default function RoadmapPage() {
     } catch (e) {
       console.error(e)
       setToast({ message: "Failed to update progress", type: "error" })
-      // revert on error
-      setRoadmap((prev) => prev.map((m) => (m.id === id ? { ...m, status: m.status } : m)))
     }
   }
 
@@ -221,63 +255,81 @@ export default function RoadmapPage() {
               <p className="text-muted-foreground">No {filter} topics to display</p>
             </Card>
           ) : (
-            filteredRoadmap.map((milestone) => (
-              <Card key={milestone.id} className="p-6 hover:shadow-lg transition-shadow">
-                <div className="flex flex-col sm:flex-row justify-between items-start gap-4">
-                  <div className="flex-1">
-                    <div className="flex items-center gap-3 mb-2">
-                      <h3 className="text-xl font-semibold text-foreground">{milestone.topic}</h3>
-                      {milestone.status === "completed" && (
-                        <CheckCircle2 className="w-5 h-5 text-green-500 flex-shrink-0" />
-                      )}
-                    </div>
-                    <p className="text-muted-foreground mb-4">{milestone.description}</p>
-                    <p className="text-sm text-muted-foreground mb-4">Estimated time: {milestone.duration}</p>
+            filteredRoadmap.map((milestone) => {
+              const groups = groupResources(milestone.resources)
+              return (
+                <Card key={milestone.id} className="p-6 hover:shadow-lg transition-shadow">
+                  <div className="flex flex-col sm:flex-row justify-between items-start gap-4">
+                    <div className="flex-1">
+                      <div className="flex items-center gap-3 mb-2">
+                        <h3 className="text-xl font-semibold text-foreground">{milestone.topic}</h3>
+                        {milestone.status === "completed" && (
+                          <CheckCircle2 className="w-5 h-5 text-green-500 flex-shrink-0" />
+                        )}
+                      </div>
+                      <p className="text-muted-foreground mb-4">{milestone.description}</p>
+                      <p className="text-sm text-muted-foreground mb-6">Estimated time: {milestone.duration}</p>
 
-                    {/* Resources */}
-                    <div className="space-y-2">
-                      {milestone.resources.map((resource, idx) => (
-                        <a
-                          key={idx}
-                          href={resource.url || "#"}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="flex items-center gap-2 text-primary hover:underline text-sm"
-                        >
-                          <ExternalLink className="w-4 h-4" />
-                          <span>{resource.title || resource.summary || resource.type}</span>
-                        </a>
-                      ))}
+                      {/* Grouped Resources */}
+                      <div className="space-y-5">
+                        {SOURCE_ORDER.map((key) => {
+                          const items = groups[key]
+                          if (!items || items.length === 0) return null
+                          return (
+                            <div key={key}>
+                              <div className="flex items-center gap-2 mb-2 font-medium">
+                                {SOURCE_ICON[key]}
+                                <span>{SOURCE_LABEL[key]}</span>
+                              </div>
+                              <ul className="ml-1 space-y-1">
+                                {items.map((resource, idx) => (
+                                  <li key={idx}>
+                                    <a
+                                      href={resource.url || "#"}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      className="flex items-center gap-2 text-primary hover:underline text-sm"
+                                    >
+                                      <ExternalLink className="w-4 h-4" />
+                                      <span>{resource.title || resource.summary || "Link"}</span>
+                                    </a>
+                                  </li>
+                                ))}
+                              </ul>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+
+                    {/* Action Buttons */}
+                    <div className="flex flex-col gap-2 w-full sm:w-auto">
+                      <Button
+                        size="sm"
+                        variant={milestone.status === "completed" ? "default" : "outline"}
+                        onClick={() => handleStatusChange(milestone.id, "completed")}
+                        className={milestone.status === "completed" ? "bg-green-500 hover:bg-green-600" : ""}
+                      >
+                        <CheckCircle2 className="w-4 h-4 mr-2" />
+                        Done
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant={milestone.status === "pending" ? "outline" : "ghost"}
+                        onClick={() => handleStatusChange(milestone.id, "pending")}
+                      >
+                        <AlertCircle className="w-4 h-4 mr-2" />
+                        Too Hard
+                      </Button>
+                      <Button size="sm" variant="outline" onClick={() => handleStatusChange(milestone.id, "skipped")}>
+                        <SkipForward className="w-4 h-4 mr-2" />
+                        Skip
+                      </Button>
                     </div>
                   </div>
-
-                  {/* Action Buttons */}
-                  <div className="flex flex-col gap-2 w-full sm:w-auto">
-                    <Button
-                      size="sm"
-                      variant={milestone.status === "completed" ? "default" : "outline"}
-                      onClick={() => handleStatusChange(milestone.id, "completed")}
-                      className={milestone.status === "completed" ? "bg-green-500 hover:bg-green-600" : ""}
-                    >
-                      <CheckCircle2 className="w-4 h-4 mr-2" />
-                      Done
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant={milestone.status === "pending" ? "outline" : "ghost"}
-                      onClick={() => handleStatusChange(milestone.id, "pending")}
-                    >
-                      <AlertCircle className="w-4 h-4 mr-2" />
-                      Too Hard
-                    </Button>
-                    <Button size="sm" variant="outline" onClick={() => handleStatusChange(milestone.id, "skipped")}>
-                      <SkipForward className="w-4 h-4 mr-2" />
-                      Skip
-                    </Button>
-                  </div>
-                </div>
-              </Card>
-            ))
+                </Card>
+              )
+            })
           )}
         </div>
       </div>
