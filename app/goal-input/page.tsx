@@ -30,7 +30,7 @@ export default function GoalInputPage() {
     topic: "",
     exam: "",
     timeValue: "",
-    timeUnit: "days",
+    timeUnit: "weeks",
     difficulty: "intermediate",
   });
 
@@ -57,15 +57,15 @@ export default function GoalInputPage() {
       setLoading(true);
       const clientId = getClientId();
 
-      // We keep your "deadline" as a free-text window (e.g., "4 weeks")
       const res = await fetch("/api/plan/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           topic: formData.topic,
           exam: formData.exam,
-          deadline: `${formData.timeValue} ${formData.timeUnit}`,
-          // difficulty is currently not used by the API (optional, for later tuning)
+          timeValue: Number(formData.timeValue),
+          timeUnit: formData.timeUnit as "days" | "weeks" | "months",
+          difficulty: formData.difficulty as "beginner" | "intermediate" | "advanced",
           clientId,
         }),
       });
@@ -91,7 +91,7 @@ export default function GoalInputPage() {
         <Card className="w-full max-w-2xl p-8">
           <h1 className="text-3xl font-bold text-foreground mb-2">Set Your Learning Goal</h1>
           <p className="text-muted-foreground mb-8">
-            Tell us about your exam preparation and we'll create a personalized roadmap
+            Tell us about your exam preparation and we'll create a personalized roadmap.
           </p>
 
           <form onSubmit={handleSubmit} className="space-y-6">
@@ -187,7 +187,7 @@ export default function GoalInputPage() {
       </div>
 
       {loading && <LoadingSpinner message="Generating your personalized roadmap..." />}
-      {toast && <Toast message={toast.message} type={toast.type} />}
+      {toast && <Toast message={toast.message} type="success" />}
     </div>
   );
 }

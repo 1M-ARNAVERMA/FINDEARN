@@ -11,8 +11,9 @@ const GH_TOKEN = process.env.GITHUB_TOKEN!;
 const inputSchema = z.object({
   topic: z.string().min(2),
   exam: z.string().optional(),
-  // We accept your "4 weeks / 10 days" style here (kept as text).
-  deadline: z.string().optional(),
+  timeValue: z.number().int().positive(),
+  timeUnit: z.enum(["days", "weeks", "months"]),
+  difficulty: z.enum(["beginner", "intermediate", "advanced"]),
   clientId: z.string().min(2),
 });
 
@@ -32,13 +33,31 @@ const aiPlanSchema = z.object({
         }),
       })
     )
-    .min(1),
+    .min(3)
+    .max(7),
 });
 
-async function callAIPlan(topic: string, exam?: string, deadline?: string) {
-  // Uses OpenRouter-style key ("sk-or-..."). Swap URL/model if you use another provider.
+function unitToDays(value: number, unit: "days" | "weeks" | "months") {
+  if (unit === "days") return value;
+  if (unit === "weeks") return value * 7;
+  return value * 30; // approx for months
+}
+
+function difficultyMultiplier(d: "beginner" | "intermediate" | "advanced") {
+  // beginner needs more time, advanced a bit less
+  if (d === "beginner") return 1.3;
+  if (d === "advanced") return 0.9;
+  return 1.0;
+}
+
+async function callAIPlan(
+  topic: string,
+  exam?: string,
+  totalHours?: number,
+  difficulty?: string
+) {
   const prompt = `
-You are FindEarn's planner. Return ONLY JSON matching this schema:
+Return ONLY JSON in this exact shape:
 {
   "milestones": [
     {
@@ -55,24 +74,20 @@ You are FindEarn's planner. Return ONLY JSON matching this schema:
     }
   ]
 }
-
 Constraints:
 - 3 to 7 milestones
-- Make queries highly specific to the milestone
-- Assume learner target: "${topic}" for "${exam ?? "general proficiency"}"
-- Time available: "${deadline ?? "unspecified"}" (use it to size est_hours roughly)
-- No extra text, no markdown, pure JSON.
-
-Now produce the JSON plan.`;
+- Make queries specific to each milestone
+- Topic: "${topic}"
+- Goal/Exam: "${exam ?? "general proficiency"}"
+- Target total study hours (approx): ${Math.max(6, Math.round(totalHours ?? 20))} hours
+- Learner level: ${difficulty ?? "intermediate"}
+- No extra text, no markdown, only JSON.`;
 
   const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${AI_KEY}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${AI_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: "openai/gpt-4o-mini", // pick a model you have access to
+      model: "openai/gpt-4o-mini",
       temperature: 0.2,
       messages: [{ role: "user", content: prompt }],
       response_format: { type: "json_object" },
@@ -149,23 +164,47 @@ async function fetchWikipedia(term: string) {
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { topic, exam, deadline, clientId } = inputSchema.parse(body);
+    const { topic, exam, timeValue, timeUnit, difficulty, clientId } = inputSchema.parse(body);
     const sb = sbWithClientId(clientId);
 
-    // 1) Plan from AI
-    const plan = await callAIPlan(topic, exam, deadline);
+    // 1) compute hours budget
+    const days = unitToDays(timeValue, timeUnit);
+    const baselineHoursPerDay = 2; // tweak later
+    const totalHoursBudget = Math.max(
+      6,
+      Math.round(days * baselineHoursPerDay * difficultyMultiplier(difficulty))
+    );
 
-    // 2) Create roadmap (note: we store deadline as text or convert later if needed)
+    // 2) plan from AI for that budget
+    const plan = await callAIPlan(topic, exam, totalHoursBudget, difficulty);
+
+    // 3) normalize est_hours to fit budget
+    const sumAI = plan.milestones.reduce((s: number, m: any) => s + (m.est_hours || 0), 0) || 1;
+    const scale = totalHoursBudget / sumAI;
+    const normalized = plan.milestones.map((m: any) => {
+      const h = Math.max(1, Math.min(40, Math.round((m.est_hours || 2) * scale)));
+      return { ...m, est_hours: h };
+    });
+
+    // 4) create roadmap with structured fields
     const { data: r, error: er } = await sb
       .from("roadmaps")
-      .insert({ client_id: clientId, topic, exam, deadline_date: null }) // keep date null for now
+      .insert({
+        client_id: clientId,
+        topic,
+        exam,
+        time_value: timeValue,
+        time_unit: timeUnit,
+        difficulty,
+        deadline_date: null,
+      })
       .select("id")
       .single();
     if (er) throw new Error(er.message);
     const roadmapId = r.id as string;
 
-    // 3) Insert milestones
-    const milestonesRows = plan.milestones.map((m, i) => ({
+    // 5) insert milestones
+    const rows = normalized.map((m: any, i: number) => ({
       client_id: clientId,
       roadmap_id: roadmapId,
       title: m.title,
@@ -173,45 +212,38 @@ export async function POST(req: NextRequest) {
       order_index: i,
       est_hours: m.est_hours,
     }));
-    const { data: insertedMilestones, error: em } = await sb
-      .from("milestones")
-      .insert(milestonesRows)
-      .select("id, order_index");
+    const { data: ms, error: em } = await sb.from("milestones").insert(rows).select("id,order_index");
     if (em) throw new Error(em.message);
+    const idByIdx = new Map<number, string>();
+    ms?.forEach((x: any) => idByIdx.set(x.order_index, x.id));
 
-    // 4) Fetch resources based on AI queries
-    const idByIndex = new Map<number, string>();
-    insertedMilestones?.forEach((row: any) => idByIndex.set(row.order_index, row.id));
-
+    // 6) fetch resources per milestone
     const allResources: any[] = [];
-    for (let i = 0; i < plan.milestones.length; i++) {
-      const m = plan.milestones[i];
-      const milestoneId = idByIndex.get(i)!;
+    for (let i = 0; i < normalized.length; i++) {
+      const m = normalized[i];
+      const mid = idByIdx.get(i)!;
+      const q = m.queries || {};
 
-      const chunks: any[] = [];
-      await Promise.all([
-        ...(m.queries.youtube || []).map((q) => fetchYouTube(q).then((r) => chunks.push(...r))),
-        ...(m.queries.books || []).map((q) => fetchBooks(q).then((r) => chunks.push(...r))),
-        ...(m.queries.github || []).map((q) => fetchGitHub(q).then((r) => chunks.push(...r))),
-        ...(m.queries.wikipedia || []).map((q) => fetchWikipedia(q).then((r) => chunks.push(...r))),
+      const buckets = await Promise.all([
+        ...(q.youtube || []).map((s: string) => fetchYouTube(s)),
+        ...(q.books || []).map((s: string) => fetchBooks(s)),
+        ...(q.github || []).map((s: string) => fetchGitHub(s)),
+        ...(q.wikipedia || []).map((s: string) => fetchWikipedia(s)),
       ]);
-
-      chunks.forEach((c, idx) => {
+      const flat = buckets.flat();
+      flat.forEach((res: any, idx: number) => {
         allResources.push({
           client_id: clientId,
-          milestone_id: milestoneId,
-          source: c.source,
-          title: c.title,
-          url: c.url,
-          meta: c.meta ?? {},
+          milestone_id: mid,
+          source: res.source,
+          title: res.title,
+          url: res.url,
+          meta: res.meta || {},
           rank_score: 1 - idx * 0.01,
         });
       });
     }
-
-    if (allResources.length) {
-      await sb.from("resources").insert(allResources);
-    }
+    if (allResources.length) await sb.from("resources").insert(allResources);
 
     return NextResponse.json({ roadmapId });
   } catch (e: any) {
