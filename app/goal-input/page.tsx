@@ -1,74 +1,88 @@
-"use client"
+"use client";
 
-import type React from "react"
+import type React from "react";
+import { useState } from "react";
+import { useRouter } from "next/navigation";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Card } from "@/components/ui/card";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import Navbar from "@/components/navbar";
+import Toast from "@/components/toast";
+import LoadingSpinner from "@/components/loading-spinner";
 
-import { useState } from "react"
-import { useRouter } from "next/navigation"
-import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
-import { Card } from "@/components/ui/card"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import Navbar from "@/components/navbar"
-import Toast from "@/components/toast"
-import LoadingSpinner from "@/components/loading-spinner"
+// Generate or retrieve client ID (stored locally; used by RLS policies)
+function getClientId() {
+  const key = "findearn_client_id";
+  let id = typeof window !== "undefined" ? localStorage.getItem(key) : null;
+  if (!id && typeof window !== "undefined") {
+    id = crypto.randomUUID();
+    localStorage.setItem(key, id);
+  }
+  return id!;
+}
 
 export default function GoalInputPage() {
-  const router = useRouter()
+  const router = useRouter();
+
   const [formData, setFormData] = useState({
     topic: "",
     exam: "",
     timeValue: "",
     timeUnit: "days",
     difficulty: "intermediate",
-  })
-  const [loading, setLoading] = useState(false)
-  const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null)
+  });
+
+  const [loading, setLoading] = useState(false);
+  const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setFormData({
-      ...formData,
-      [e.target.name]: e.target.value,
-    })
-  }
+    setFormData((s) => ({ ...s, [e.target.name]: e.target.value }));
+  };
 
   const handleSelectChange = (name: string, value: string) => {
-    setFormData({
-      ...formData,
-      [name]: value,
-    })
-  }
+    setFormData((s) => ({ ...s, [name]: value }));
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
+    e.preventDefault();
 
     if (!formData.topic || !formData.exam || !formData.timeValue) {
-      setToast({ message: "Please fill in all required fields", type: "error" })
-      return
+      setToast({ message: "Please fill in all required fields", type: "error" });
+      return;
     }
 
-    setLoading(true)
+    try {
+      setLoading(true);
+      const clientId = getClientId();
 
-    // Simulate API call to /generateRoadmap
-    setTimeout(() => {
-      setToast({ message: "Generating your personalized roadmap...", type: "success" })
-      setLoading(false)
-      setTimeout(() => {
-        // Mock storing the roadmap data
-        localStorage.setItem(
-          "currentRoadmap",
-          JSON.stringify({
-            topic: formData.topic,
-            exam: formData.exam,
-            time: `${formData.timeValue} ${formData.timeUnit}`,
-            difficulty: formData.difficulty,
-            milestones: generateMockRoadmap(formData),
-          }),
-        )
-        router.push("/roadmap")
-      }, 1500)
-    }, 2000)
-  }
+      // We keep your "deadline" as a free-text window (e.g., "4 weeks")
+      const res = await fetch("/api/plan/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          topic: formData.topic,
+          exam: formData.exam,
+          deadline: `${formData.timeValue} ${formData.timeUnit}`,
+          // difficulty is currently not used by the API (optional, for later tuning)
+          clientId,
+        }),
+      });
+
+      const json = await res.json();
+      setLoading(false);
+
+      if (json.roadmapId) {
+        router.push(`/roadmap?rid=${json.roadmapId}&cid=${clientId}`);
+      } else {
+        setToast({ message: json.error || "Failed to generate", type: "error" });
+      }
+    } catch (err) {
+      setLoading(false);
+      setToast({ message: "Server error, try again", type: "error" });
+    }
+  };
 
   return (
     <div className="min-h-screen bg-background">
@@ -128,7 +142,7 @@ export default function GoalInputPage() {
                   value={formData.timeValue}
                   onChange={handleChange}
                   required
-                  min="1"
+                  min={1}
                   className="mt-2"
                 />
               </div>
@@ -175,49 +189,5 @@ export default function GoalInputPage() {
       {loading && <LoadingSpinner message="Generating your personalized roadmap..." />}
       {toast && <Toast message={toast.message} type={toast.type} />}
     </div>
-  )
-}
-
-function generateMockRoadmap(formData: any) {
-  const topics = formData.topic.split(",").map((t: string) => t.trim())
-  const baseTopics = topics.length > 0 ? topics : ["Topic 1", "Topic 2", "Topic 3"]
-
-  return [
-    {
-      id: 1,
-      topic: baseTopics[0] || "Fundamentals",
-      description: "Learn the core concepts and foundations",
-      duration: "3 days",
-      resources: [
-        { type: "YouTube", title: "Complete Tutorial", url: "#" },
-        { type: "GitHub", title: "Example Code", url: "#" },
-        { type: "Wikipedia", summary: "Comprehensive overview" },
-      ],
-      status: "pending",
-    },
-    {
-      id: 2,
-      topic: baseTopics[1] || "Advanced Concepts",
-      description: "Dive deeper into advanced topics",
-      duration: "4 days",
-      resources: [
-        { type: "YouTube", title: "Advanced Techniques", url: "#" },
-        { type: "GitHub", title: "Implementation Guide", url: "#" },
-        { type: "Wikipedia", summary: "Detailed explanation" },
-      ],
-      status: "pending",
-    },
-    {
-      id: 3,
-      topic: baseTopics[2] || "Practice & Review",
-      description: "Reinforce learning with practice problems",
-      duration: "2 days",
-      resources: [
-        { type: "YouTube", title: "Problem Solving", url: "#" },
-        { type: "GitHub", title: "Practice Questions", url: "#" },
-        { type: "Wikipedia", summary: "Reference material" },
-      ],
-      status: "pending",
-    },
-  ]
+  );
 }

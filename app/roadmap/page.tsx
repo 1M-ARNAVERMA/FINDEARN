@@ -1,62 +1,173 @@
 "use client"
 
-import { useState, useEffect } from "react"
-import { useRouter } from "next/navigation"
+import { useState, useEffect, useMemo } from "react"
+import { useRouter, useSearchParams } from "next/navigation"
 import Link from "next/link"
+import { createClient } from "@supabase/supabase-js"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { CheckCircle2, AlertCircle, SkipForward, ExternalLink, BarChart3 } from "lucide-react"
 import Navbar from "@/components/navbar"
 import Toast from "@/components/toast"
 
+type UiStatus = "pending" | "completed" | "skipped"
+
 interface Milestone {
-  id: number
+  id: string
   topic: string
   description: string
   duration: string
   resources: Array<{ type: string; title?: string; summary?: string; url?: string }>
-  status: "pending" | "completed" | "skipped"
+  status: UiStatus
+}
+
+function getClientId() {
+  const key = "findearn_client_id"
+  let id = typeof window !== "undefined" ? localStorage.getItem(key) : null
+  if (!id && typeof window !== "undefined") {
+    id = crypto.randomUUID()
+    localStorage.setItem(key, id)
+  }
+  return id ?? "server"
+}
+
+function mapDbStatusToUi(status?: string): UiStatus {
+  // DB uses: 'pending','in_progress','done','skipped','hard'
+  if (status === "done") return "completed"
+  if (status === "skipped") return "skipped"
+  return "pending"
+}
+
+function mapUiStatusToDb(status: UiStatus): "pending" | "done" | "skipped" {
+  if (status === "completed") return "done"
+  if (status === "skipped") return "skipped"
+  return "pending"
 }
 
 export default function RoadmapPage() {
   const router = useRouter()
+  const searchParams = useSearchParams()
   const [roadmap, setRoadmap] = useState<Milestone[]>([])
   const [filter, setFilter] = useState<"all" | "completed" | "pending">("all")
   const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null)
+  const [loading, setLoading] = useState<boolean>(true)
 
+  // read params
+  const roadmapId = searchParams.get("rid") || ""
+  const clientIdFromUrl = searchParams.get("cid") || ""
+
+  // supabase client with x-client-id header
+  const supabase = useMemo(() => {
+    const cid = clientIdFromUrl || getClientId()
+    return createClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL as string,
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY as string,
+      { global: { headers: { "x-client-id": cid } } }
+    )
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clientIdFromUrl])
+
+  // initial load from Supabase (roadmap + milestones + resources)
   useEffect(() => {
-    const saved = localStorage.getItem("currentRoadmap")
-    if (saved) {
-      const data = JSON.parse(saved)
-      setRoadmap(data.milestones || [])
-    }
-  }, [])
+    async function load() {
+      try {
+        setLoading(true)
+        const cid = clientIdFromUrl || getClientId()
+        if (!roadmapId || !cid) {
+          setLoading(false)
+          return
+        }
 
-  const handleStatusChange = (id: number, newStatus: "pending" | "completed" | "skipped") => {
+        // fetch milestones
+        const { data: milestones, error: mErr } = await supabase
+          .from("milestones")
+          .select("*")
+          .eq("roadmap_id", roadmapId)
+          .order("order_index")
+
+        if (mErr) throw mErr
+
+        // fetch resources for these milestones
+        const ids = (milestones || []).map((m: any) => m.id)
+        let resources: any[] = []
+        if (ids.length) {
+          const { data: resData, error: rErr } = await supabase
+            .from("resources")
+            .select("*")
+            .in("milestone_id", ids)
+          if (rErr) throw rErr
+          resources = resData || []
+        }
+
+        const merged: Milestone[] =
+          (milestones || []).map((m: any) => ({
+            id: m.id,
+            topic: m.title,
+            description: m.description || "",
+            duration: (m.est_hours ? `${m.est_hours}` : "2") + " hrs",
+            status: mapDbStatusToUi(m.status),
+            resources: (resources || [])
+              .filter((r) => r.milestone_id === m.id)
+              .map((r) => ({
+                type: r.source,
+                title: r.title,
+                url: r.url,
+                summary: r.meta?.extract,
+              })),
+          })) ?? []
+
+        setRoadmap(merged)
+      } catch (e) {
+        console.error(e)
+        setToast({ message: "Failed to load roadmap", type: "error" })
+      } finally {
+        setLoading(false)
+      }
+    }
+    load()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roadmapId, clientIdFromUrl])
+
+  const handleStatusChange = async (id: string, newStatus: UiStatus) => {
+    // optimistic UI
     const updated = roadmap.map((m) => (m.id === id ? { ...m, status: newStatus } : m))
     setRoadmap(updated)
 
-    // Show toast
-    const messages: Record<string, string> = {
-      completed: "Progress updated! Keep up the great work!",
-      pending: "We'll help you with this topic",
-      skipped: "Topic skipped. We'll adjust your roadmap.",
-    }
-    setToast({ message: messages[newStatus], type: "success" })
+    try {
+      // update milestone status in DB
+      const dbStatus = mapUiStatusToDb(newStatus)
+      const { error: uErr } = await supabase.from("milestones").update({ status: dbStatus }).eq("id", id)
+      if (uErr) throw uErr
 
-    // Simulate API call to /updateProgress
-    localStorage.setItem(
-      "currentRoadmap",
-      JSON.stringify({
-        ...JSON.parse(localStorage.getItem("currentRoadmap") || "{}"),
-        milestones: updated,
-      }),
-    )
+      // log feedback
+      const cid = clientIdFromUrl || getClientId()
+      await supabase.from("feedback").insert({
+        milestone_id: id,
+        client_id: cid,
+        action: dbStatus === "done" ? "done" : dbStatus, // 'pending' | 'done' | 'skipped'
+      })
+
+      // toast
+      const messages: Record<UiStatus, string> = {
+        completed: "Progress updated! Keep up the great work!",
+        pending: "We'll help you with this topic",
+        skipped: "Topic skipped. We'll adjust your roadmap.",
+      }
+      setToast({ message: messages[newStatus], type: "success" })
+    } catch (e) {
+      console.error(e)
+      setToast({ message: "Failed to update progress", type: "error" })
+      // revert on error
+      setRoadmap((prev) => prev.map((m) => (m.id === id ? { ...m, status: m.status } : m)))
+    }
   }
 
-  const filteredRoadmap = roadmap.filter((m) => (filter === "all" ? true : m.status === filter))
+  const filteredRoadmap = useMemo(
+    () => roadmap.filter((m) => (filter === "all" ? true : m.status === filter)),
+    [roadmap, filter]
+  )
 
-  const completedCount = roadmap.filter((m) => m.status === "completed").length
+  const completedCount = useMemo(() => roadmap.filter((m) => m.status === "completed").length, [roadmap])
   const progress = roadmap.length > 0 ? Math.round((completedCount / roadmap.length) * 100) : 0
 
   return (
@@ -79,7 +190,7 @@ export default function RoadmapPage() {
             <div
               className="bg-primary h-full transition-all duration-500 rounded-full"
               style={{ width: `${progress}%` }}
-            ></div>
+            />
           </div>
           <p className="text-sm text-muted-foreground mt-2">{progress}% Complete</p>
         </div>
@@ -89,9 +200,9 @@ export default function RoadmapPage() {
           {["all", "completed", "pending"].map((f) => (
             <Button
               key={f}
-              variant={filter === f ? "default" : "outline"}
+              variant={filter === (f as "all" | "completed" | "pending") ? "default" : "outline"}
               size="sm"
-              onClick={() => setFilter(f as any)}
+              onClick={() => setFilter(f as "all" | "completed" | "pending")}
               className={filter === f ? "bg-primary" : ""}
             >
               {f.charAt(0).toUpperCase() + f.slice(1)}
@@ -101,7 +212,11 @@ export default function RoadmapPage() {
 
         {/* Roadmap Cards */}
         <div className="space-y-4">
-          {filteredRoadmap.length === 0 ? (
+          {loading ? (
+            <Card className="p-8 text-center">
+              <p className="text-muted-foreground">Loading your roadmap…</p>
+            </Card>
+          ) : filteredRoadmap.length === 0 ? (
             <Card className="p-8 text-center">
               <p className="text-muted-foreground">No {filter} topics to display</p>
             </Card>
@@ -125,6 +240,8 @@ export default function RoadmapPage() {
                         <a
                           key={idx}
                           href={resource.url || "#"}
+                          target="_blank"
+                          rel="noreferrer"
                           className="flex items-center gap-2 text-primary hover:underline text-sm"
                         >
                           <ExternalLink className="w-4 h-4" />
@@ -147,7 +264,7 @@ export default function RoadmapPage() {
                     </Button>
                     <Button
                       size="sm"
-                      variant={milestone.status === "pending" && milestone.status !== "completed" ? "outline" : "ghost"}
+                      variant={milestone.status === "pending" ? "outline" : "ghost"}
                       onClick={() => handleStatusChange(milestone.id, "pending")}
                     >
                       <AlertCircle className="w-4 h-4 mr-2" />
